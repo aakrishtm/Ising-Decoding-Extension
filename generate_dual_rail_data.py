@@ -140,11 +140,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--samples-per-shard", type=int, default=1024, help="Samples in each NPZ shard.")
     parser.add_argument("--seed", type=int, default=0, help="Random seed for deterministic generation.")
     parser.add_argument("--num-shots", type=int, default=262144, help="Number of detector-sample shots for stim-stub mode.")
+    parser.add_argument("--data-source", choices=("auto", "stim", "synthetic"), default="auto")
+    parser.add_argument("--basis", action="append", choices=("X", "Z"), default=None)
+    parser.add_argument("--compress", action="store_true", help="Use compressed NPZ output.")
     parser.add_argument(
         "--artifact",
         choices=("dataset", "stim-stub"),
         default="dataset",
-        help="Write NPZ dataset shards, or create the old Stim sample stub outputs.",
+        help="Write NPZ dataset shards, or create the legacy Stim sample stub outputs.",
     )
     parser.add_argument(
         "--output-dir",
@@ -178,6 +181,9 @@ def main() -> None:
         p_pauli=args.p_pauli,
         p_ambiguity=args.p_ambiguity,
         seed=args.seed,
+        data_source=args.data_source,
+        bases=tuple(args.basis or ("X", "Z")),
+        compress=args.compress,
     )
     print(f"Wrote dual-rail dataset: {dataset_dir}")
 

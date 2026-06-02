@@ -12,7 +12,14 @@ except ImportError:
     torch = None
 
 from dual_rail_qec.data.datasets import DualRailShardDataset
-from dual_rail_qec.data.export import write_dataset
+from dual_rail_qec.data.export import resolve_data_source, write_dataset
+from dual_rail_qec.data.simulator import (
+    generate_erasure_sidecar,
+    generate_stim_assisted_events,
+    logical_erasure_parity,
+    pack_erasure_sidecar,
+    stim,
+)
 from dual_rail_qec.telemetry.schema import DualRailState, HardwareEvent, QubitRole
 from dual_rail_qec.telemetry.tensorize import make_local_targets, tensorize_events
 
@@ -81,6 +88,7 @@ class TestDualRailQEC(unittest.TestCase):
                 p_pauli=0.01,
                 p_ambiguity=0.02,
                 seed=123,
+                data_source="synthetic",
             )
             ds = DualRailShardDataset(dataset_dir)
             self.assertEqual(len(ds), 8)
@@ -90,6 +98,59 @@ class TestDualRailQEC(unittest.TestCase):
             self.assertEqual(shards[0]["targets"].shape, (4, 4, 3, 3, 3))
             self.assertEqual(shards[0]["logical_labels"].shape, (4, 1))
             self.assertEqual(shards[0]["inputs"].dtype, np.float32)
+            sample = ds.get_sample(7)
+            self.assertEqual(sample["inputs"].shape, (7, 3, 3, 3))
+
+    def test_data_source_resolution(self):
+        self.assertEqual(resolve_data_source("synthetic"), "synthetic")
+        if stim is None:
+            with self.assertRaises(RuntimeError):
+                resolve_data_source("stim")
+            self.assertEqual(resolve_data_source("auto"), "synthetic")
+
+    def test_erasure_sidecar_is_shot_round_site_aligned(self):
+        rng = np.random.default_rng(5)
+        sidecar = generate_erasure_sidecar(
+            distance=3,
+            rounds=3,
+            num_shots=4,
+            p_erasure=0.1,
+            p_ambiguity=0.05,
+            basis="X",
+            rng=rng,
+        )
+        self.assertEqual(sidecar.data_erasures.shape, (4, 3, 3, 3))
+        self.assertEqual(sidecar.measure_erasures.shape, (4, 3, 3, 3))
+        self.assertEqual(sidecar.readout_ambiguity.shape, (4, 3, 3, 3))
+        packed = pack_erasure_sidecar(sidecar)
+        self.assertEqual(tuple(packed["shape"]), (4, 3, 3, 3))
+        self.assertIn("data_erasures", packed)
+        self.assertIn("measure_erasures", packed)
+
+    def test_erasure_sidecar_couples_into_syndrome_events(self):
+        rng = np.random.default_rng(9)
+        sidecar = generate_erasure_sidecar(
+            distance=3,
+            rounds=3,
+            num_shots=1,
+            p_erasure=1.0,
+            p_ambiguity=0.0,
+            basis="X",
+            rng=rng,
+        )
+        events = generate_stim_assisted_events(
+            distance=3,
+            rounds=3,
+            shot_index=0,
+            detector_samples=np.zeros((1, 0), dtype=np.uint8),
+            basis="X",
+            detector_coordinates={},
+            erasure_sidecar=sidecar,
+        )
+        tensor = tensorize_events(events, distance=3, rounds=3)
+        self.assertGreater(float(tensor[2].sum() + tensor[3].sum()), 0.0)
+        self.assertGreater(float(tensor[0].sum() + tensor[1].sum()), 0.0)
+        self.assertIn(logical_erasure_parity(sidecar, 0), (0, 1))
 
     def test_model_and_residual_smoke(self):
         if torch is None:
