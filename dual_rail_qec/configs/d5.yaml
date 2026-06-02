@@ -1,0 +1,5 @@
+distance: 5
+rounds: 5
+p_erasure: 0.01
+p_pauli: 0.001
+p_ambiguity: 0.0
