@@ -14,10 +14,11 @@ except ImportError:
 from dual_rail_qec.data.datasets import DualRailShardDataset
 from dual_rail_qec.data.export import resolve_data_source, write_dataset
 from dual_rail_qec.data.simulator import (
+    build_base_surface_code_circuit,
     generate_erasure_sidecar,
     generate_stim_assisted_events,
-    logical_erasure_parity,
     pack_erasure_sidecar,
+    sample_per_erasure_stim_shot,
     stim,
 )
 from dual_rail_qec.telemetry.schema import DualRailState, HardwareEvent, QubitRole
@@ -127,7 +128,7 @@ class TestDualRailQEC(unittest.TestCase):
         self.assertIn("data_erasures", packed)
         self.assertIn("measure_erasures", packed)
 
-    def test_erasure_sidecar_couples_into_syndrome_events(self):
+    def test_erasure_sidecar_adds_telemetry_not_synthetic_syndrome(self):
         rng = np.random.default_rng(9)
         sidecar = generate_erasure_sidecar(
             distance=3,
@@ -149,8 +150,40 @@ class TestDualRailQEC(unittest.TestCase):
         )
         tensor = tensorize_events(events, distance=3, rounds=3)
         self.assertGreater(float(tensor[2].sum() + tensor[3].sum()), 0.0)
-        self.assertGreater(float(tensor[0].sum() + tensor[1].sum()), 0.0)
-        self.assertIn(logical_erasure_parity(sidecar, 0), (0, 1))
+        self.assertEqual(float(tensor[0].sum() + tensor[1].sum()), 0.0)
+
+    def test_per_erasure_stim_sampler_smoke(self):
+        if stim is None:
+            self.skipTest("stim is not installed")
+        base_circuit = build_base_surface_code_circuit(
+            distance=3,
+            rounds=3,
+            basis="X",
+            p_pauli=0.0,
+            p_measure=0.0,
+        )
+        sidecar = generate_erasure_sidecar(
+            distance=3,
+            rounds=3,
+            num_shots=1,
+            p_erasure=0.25,
+            p_ambiguity=0.0,
+            p_false_positive=0.01,
+            p_false_negative=0.01,
+            basis="X",
+            rng=np.random.default_rng(42),
+        )
+        det_row, obs_row = sample_per_erasure_stim_shot(
+            base_circuit,
+            sidecar=sidecar,
+            shot_index=0,
+            distance=3,
+            rounds=3,
+            seed=42,
+        )
+        self.assertEqual(det_row.ndim, 1)
+        self.assertEqual(obs_row.ndim, 1)
+        self.assertGreater(det_row.size, 0)
 
     def test_model_and_residual_smoke(self):
         if torch is None:

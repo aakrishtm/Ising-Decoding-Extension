@@ -1,10 +1,9 @@
 """Dual-rail telemetry generators.
 
 The synthetic path is a deterministic schema exerciser. The Stim-assisted path
-uses unmodified Stim surface-code memory circuits for syndrome/logical dynamics
-and generates explicit erasure telemetry as a shot/round/site-aligned sidecar.
-This is still a first-pass dual-rail approximation, not an exact cavity-hardware
-timing model.
+samples explicit erasure patterns, builds per-shot Stim circuits with
+deterministic Pauli error instructions at the corresponding spacetime sites, and
+stores the same erasure patterns as telemetry sidecars.
 """
 
 from __future__ import annotations
@@ -24,19 +23,42 @@ except ImportError:
 
 
 INJECTION_RULE = (
-    "No erasure instruction is injected into the Stim circuit. Stim provides "
-    "unmodified detector/logical samples; explicit dual-rail erasure telemetry "
-    "is generated as sidecar arrays aligned by shot, round, and grid site."
+    "No measurement-producing erasure instruction is injected into the Stim circuit. "
+    "For each sampled erasure pattern, deterministic Pauli error instructions "
+    "X_ERROR(1), Y_ERROR(1), or Z_ERROR(1) are inserted at non-measurement-producing "
+    "spacetime locations. This preserves DETECTOR/OBSERVABLE rec offsets."
 )
 
 COUPLING_RULE = (
-    "Coupled first-pass dual-rail approximation: each explicit erasure sidecar "
-    "event is also converted into deterministic local detector events before "
-    "tensorization. Data-qubit erasures light up neighboring measure sites in "
-    "the same and next round; measure-qubit erasures light up their own site in "
-    "the same and next round. Logical labels are Stim observable parity XOR a "
-    "central-strip erasure parity proxy."
+    "Per-erasure Stim circuit conversion: true erasure events are sampled first, "
+    "then converted into deterministic Pauli error instructions in a per-shot "
+    "Stim circuit. Detector and logical samples are taken from that modified "
+    "circuit, while the observed erasure detections are preserved as telemetry. "
+    "False positives appear only in telemetry; false negatives affect the circuit "
+    "without appearing in telemetry."
 )
+
+
+@dataclass(frozen=True)
+class ErasureNoiseModel:
+    """Noise parameters for coupled dual-rail erasure simulations."""
+
+    p_erasure: float
+    p_pauli: float
+    p_measure: float = 0.0
+    p_false_positive: float = 0.0
+    p_false_negative: float = 0.0
+    p_ambiguity: float = 0.0
+
+    def to_dict(self) -> dict[str, float]:
+        return {
+            "p_erasure": float(self.p_erasure),
+            "p_pauli": float(self.p_pauli),
+            "p_measure": float(self.p_measure),
+            "p_false_positive": float(self.p_false_positive),
+            "p_false_negative": float(self.p_false_negative),
+            "p_ambiguity": float(self.p_ambiguity),
+        }
 
 
 @dataclass(frozen=True)
@@ -76,6 +98,24 @@ class ErasureSidecarBatch:
     measure_erasures: np.ndarray
     readout_ambiguity: np.ndarray
     site_records: list[ErasureSiteRecord]
+    physical_data_erasures: np.ndarray | None = None
+    physical_measure_erasures: np.ndarray | None = None
+    false_positive_data: np.ndarray | None = None
+    false_positive_measure: np.ndarray | None = None
+    false_negative_data: np.ndarray | None = None
+    false_negative_measure: np.ndarray | None = None
+
+
+@dataclass(frozen=True)
+class StimQubitSite:
+    """Mapping from one Stim qubit to the dense decoder grid."""
+
+    qubit: int
+    stim_x: float
+    stim_y: float
+    grid_x: int
+    grid_y: int
+    role: QubitRole
 
 
 def _require_stim():
@@ -146,6 +186,7 @@ def build_base_surface_code_circuit(
     rounds: int,
     basis: str,
     p_pauli: float,
+    p_measure: float = 0.0,
 ):
     """Build Stim's generated rotated surface-code memory circuit."""
     stim_module = _require_stim()
@@ -162,6 +203,8 @@ def build_base_surface_code_circuit(
         distance=int(distance),
         rounds=int(rounds),
         after_clifford_depolarization=float(p_pauli),
+        before_measure_flip_probability=float(p_measure),
+        after_reset_flip_probability=float(p_pauli),
     )
 
 
@@ -250,6 +293,189 @@ def _coord_bounds_from_map(coord_map: dict[int, tuple[float, float]]) -> tuple[f
     return min(xs), max(xs), min(ys), max(ys)
 
 
+def _as_flat_circuit_text(circuit) -> str:
+    flat = circuit.flattened() if hasattr(circuit, "flattened") else circuit
+    return str(flat)
+
+
+def extract_stim_qubit_layout(circuit, *, distance: int) -> list[StimQubitSite]:
+    """Extract Stim qubit coordinates and map them onto the dense d-by-d grid."""
+    coord_map: dict[int, tuple[float, float]] = {}
+    for line in _as_flat_circuit_text(circuit).splitlines():
+        parsed = _parse_qubit_coords(line.strip())
+        if parsed is not None:
+            qubit, stim_x, stim_y = parsed
+            coord_map[int(qubit)] = (float(stim_x), float(stim_y))
+    bounds = _coord_bounds_from_map(coord_map)
+    sites: list[StimQubitSite] = []
+    for qubit, (stim_x, stim_y) in sorted(coord_map.items()):
+        grid_x, grid_y = _grid_coord_from_stim(stim_x, stim_y, distance=distance, bounds=bounds)
+        role = _role_from_stim_coords(stim_x, stim_y)
+        sites.append(
+            StimQubitSite(
+                qubit=int(qubit),
+                stim_x=float(stim_x),
+                stim_y=float(stim_y),
+                grid_x=grid_x,
+                grid_y=grid_y,
+                role=role,
+            )
+        )
+    return sites
+
+
+def _nearest_site(
+    sites: Sequence[StimQubitSite],
+    *,
+    grid_x: int,
+    grid_y: int,
+    preferred_role: QubitRole | None,
+) -> StimQubitSite | None:
+    candidates = list(sites)
+    if preferred_role is not None:
+        role_candidates = [site for site in candidates if site.role == preferred_role]
+        if role_candidates:
+            candidates = role_candidates
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda site: (site.grid_x - int(grid_x)) ** 2 + (site.grid_y - int(grid_y)) ** 2,
+    )
+
+
+def _tick_count(circuit) -> int:
+    return sum(1 for line in _as_flat_circuit_text(circuit).splitlines() if _operation_name(line.strip()) == "TICK")
+
+
+def _round_to_tick(round_id: int, *, rounds: int, total_ticks: int) -> int:
+    if int(total_ticks) <= 0:
+        return 0
+    return max(0, min(int(total_ticks) - 1, int(round(int(round_id) * int(total_ticks) / max(int(rounds), 1)))))
+
+
+def _pauli_for_data_erasure(rng: np.random.Generator) -> str:
+    return str(rng.choice(np.asarray(["X", "Y", "Z"], dtype=object)))
+
+
+def _pauli_for_measure_erasure(role: QubitRole, basis: str, rng: np.random.Generator) -> str:
+    if role == QubitRole.X_MEASURE:
+        return "Z"
+    if role == QubitRole.Z_MEASURE:
+        return "X"
+    return _pauli_for_data_erasure(rng)
+
+
+def _append_pauli_error(insertions: dict[int, dict[str, list[int]]], tick: int, pauli: str, qubit: int) -> None:
+    if pauli not in {"X", "Y", "Z"}:
+        raise ValueError(f"Unsupported Pauli {pauli!r}")
+    insertions.setdefault(int(tick), {}).setdefault(pauli, []).append(int(qubit))
+
+
+def _physical_mask(sidecar: ErasureSidecarBatch, *, data: bool, shot_index: int) -> np.ndarray:
+    if data:
+        source = sidecar.physical_data_erasures if sidecar.physical_data_erasures is not None else sidecar.data_erasures
+    else:
+        source = sidecar.physical_measure_erasures if sidecar.physical_measure_erasures is not None else sidecar.measure_erasures
+    return np.asarray(source[int(shot_index)], dtype=np.uint8)
+
+
+def build_per_erasure_stim_circuit(
+    base_circuit,
+    *,
+    sidecar: ErasureSidecarBatch,
+    shot_index: int,
+    distance: int,
+    rounds: int,
+    rng: np.random.Generator,
+):
+    """Return a per-shot circuit with erasures converted into Pauli errors.
+
+    The inserted instructions are noise instructions with probability one, e.g.
+    ``X_ERROR(1) q``. They do not create measurement records, so existing
+    ``DETECTOR`` and ``OBSERVABLE_INCLUDE`` references remain valid.
+    """
+    stim_module = _require_stim()
+    sites = extract_stim_qubit_layout(base_circuit, distance=distance)
+    total_ticks = _tick_count(base_circuit)
+    insertions: dict[int, dict[str, list[int]]] = {}
+    data_mask = _physical_mask(sidecar, data=True, shot_index=shot_index)
+    measure_mask = _physical_mask(sidecar, data=False, shot_index=shot_index)
+
+    for t in range(int(rounds)):
+        tick = _round_to_tick(t, rounds=rounds, total_ticks=total_ticks)
+        for x in range(int(distance)):
+            for y in range(int(distance)):
+                if bool(data_mask[t, x, y]):
+                    site = _nearest_site(sites, grid_x=x, grid_y=y, preferred_role=QubitRole.DATA)
+                    if site is not None:
+                        _append_pauli_error(insertions, tick, _pauli_for_data_erasure(rng), site.qubit)
+                if bool(measure_mask[t, x, y]):
+                    role = SurfacePatchGeometry(distance=int(distance)).role_at(x, y)
+                    preferred = role if role != QubitRole.DATA else _detector_role_for_grid(
+                        SurfacePatchGeometry(distance=int(distance)), x, y, sidecar.basis
+                    )
+                    site = _nearest_site(sites, grid_x=x, grid_y=y, preferred_role=preferred)
+                    if site is not None:
+                        _append_pauli_error(
+                            insertions,
+                            tick,
+                            _pauli_for_measure_erasure(preferred, sidecar.basis, rng),
+                            site.qubit,
+                        )
+
+    output_lines: list[str] = []
+    seen_tick = -1
+    inserted_zero_tick = False
+    for line in _as_flat_circuit_text(base_circuit).splitlines():
+        stripped = line.strip()
+        if _operation_name(stripped) == "TICK":
+            seen_tick += 1
+            output_lines.append(line)
+            for pauli, qubits in sorted(insertions.get(seen_tick, {}).items()):
+                if qubits:
+                    output_lines.append(f"{pauli}_ERROR(1) " + " ".join(str(q) for q in sorted(set(qubits))))
+            inserted_zero_tick = True
+        else:
+            output_lines.append(line)
+
+    if not inserted_zero_tick and insertions:
+        for by_pauli in insertions.values():
+            for pauli, qubits in sorted(by_pauli.items()):
+                if qubits:
+                    output_lines.append(f"{pauli}_ERROR(1) " + " ".join(str(q) for q in sorted(set(qubits))))
+
+    return stim_module.Circuit("\n".join(output_lines) + "\n")
+
+
+def sample_per_erasure_stim_shot(
+    base_circuit,
+    *,
+    sidecar: ErasureSidecarBatch,
+    shot_index: int,
+    distance: int,
+    rounds: int,
+    seed: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Sample one detector/observable row from a per-erasure Stim circuit."""
+    rng = np.random.default_rng(seed)
+    circuit = build_per_erasure_stim_circuit(
+        base_circuit,
+        sidecar=sidecar,
+        shot_index=shot_index,
+        distance=distance,
+        rounds=rounds,
+        rng=rng,
+    )
+    sampler = _compile_sampler(circuit, seed=seed, detector=True)
+    try:
+        dets, obs = sampler.sample(shots=1, separate_observables=True)
+    except TypeError:
+        dets = sampler.sample(shots=1)
+        obs = np.zeros((1, 1), dtype=np.uint8)
+    return np.asarray(dets[0], dtype=np.uint8), np.asarray(obs[0], dtype=np.uint8)
+
+
 def _compile_sampler(circuit, *, seed: int | None, detector: bool):
     if detector:
         try:
@@ -269,6 +495,7 @@ def sample_stim_basis(
     basis: str,
     num_shots: int,
     p_pauli: float,
+    p_measure: float = 0.0,
     seed: int | None = None,
 ) -> StimSampleBatch:
     """Sample detector and observable data from an unmodified Stim circuit."""
@@ -277,6 +504,7 @@ def sample_stim_basis(
         rounds=rounds,
         basis=basis,
         p_pauli=p_pauli,
+        p_measure=p_measure,
     )
 
     detector_sampler = _compile_sampler(circuit, seed=seed, detector=True)
@@ -309,6 +537,8 @@ def generate_erasure_sidecar(
     num_shots: int,
     p_erasure: float,
     p_ambiguity: float,
+    p_false_positive: float = 0.0,
+    p_false_negative: float = 0.0,
     basis: str,
     rng: np.random.Generator,
 ) -> ErasureSidecarBatch:
@@ -337,15 +567,23 @@ def generate_erasure_sidecar(
                     )
                 )
 
-    erasure_draws = rng.random((int(num_shots), int(rounds), h, w)) < float(p_erasure)
+    true_erasures = rng.random((int(num_shots), int(rounds), h, w)) < float(p_erasure)
+    false_positives = rng.random((int(num_shots), int(rounds), h, w)) < float(p_false_positive)
+    false_negatives = rng.random((int(num_shots), int(rounds), h, w)) < float(p_false_negative)
     ambiguity_draws = rng.random((int(num_shots), int(rounds), h, w)) < float(p_ambiguity)
     ambiguity_strength = rng.uniform(0.0, 1.0, size=(int(num_shots), int(rounds), h, w)).astype(np.float32)
     ambiguity = np.where(ambiguity_draws, ambiguity_strength, 0.0).astype(np.float32)
 
     data_sites = data_mask[None, None, :, :]
     measure_sites = measure_mask[None, None, :, :]
-    data_erasures = np.logical_or(erasure_draws, ambiguity_draws) & data_sites
-    measure_erasures = np.logical_or(erasure_draws, ambiguity_draws) & measure_sites
+    physical_data = true_erasures & data_sites
+    physical_measure = true_erasures & measure_sites
+    false_positive_events = false_positives & ~true_erasures
+    false_negative_events = false_negatives & true_erasures
+    observed_flags = np.logical_or(true_erasures & ~false_negative_events, false_positive_events)
+    observed_flags = np.logical_or(observed_flags, ambiguity_draws)
+    data_erasures = observed_flags & data_sites
+    measure_erasures = observed_flags & measure_sites
 
     return ErasureSidecarBatch(
         basis=str(basis).strip().upper(),
@@ -353,6 +591,12 @@ def generate_erasure_sidecar(
         measure_erasures=measure_erasures.astype(np.uint8),
         readout_ambiguity=ambiguity,
         site_records=site_records,
+        physical_data_erasures=physical_data.astype(np.uint8),
+        physical_measure_erasures=physical_measure.astype(np.uint8),
+        false_positive_data=(false_positive_events & data_sites).astype(np.uint8),
+        false_positive_measure=(false_positive_events & measure_sites).astype(np.uint8),
+        false_negative_data=(false_negative_events & data_sites).astype(np.uint8),
+        false_negative_measure=(false_negative_events & measure_sites).astype(np.uint8),
     )
 
 
@@ -361,52 +605,6 @@ def _detector_role_for_grid(geometry: SurfacePatchGeometry, x: int, y: int, basi
     if role != QubitRole.DATA:
         return role
     return QubitRole.X_MEASURE if str(basis).strip().upper() == "X" else QubitRole.Z_MEASURE
-
-
-def _neighbor_measure_sites(
-    geometry: SurfacePatchGeometry,
-    x: int,
-    y: int,
-    basis: str,
-) -> list[tuple[int, int, QubitRole]]:
-    sites = []
-    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-        nx, ny = int(x) + dx, int(y) + dy
-        if not geometry.in_bounds(nx, ny):
-            continue
-        role = geometry.role_at(nx, ny)
-        if role != QubitRole.DATA:
-            sites.append((nx, ny, role))
-    if sites:
-        return sites
-
-    # Boundary/corner fallback for the compressed d-by-d scaffold.
-    role = QubitRole.X_MEASURE if str(basis).strip().upper() == "X" else QubitRole.Z_MEASURE
-    return [(int(x), int(y), role)]
-
-
-def _add_syndrome_event(
-    events: list[HardwareEvent],
-    *,
-    basis: str,
-    round_id: int,
-    x: int,
-    y: int,
-    role: QubitRole,
-    reason: str,
-) -> None:
-    events.append(
-        HardwareEvent(
-            round_id=int(round_id),
-            qubit_id=f"COUPLED:{basis}:{reason}:{round_id}:{x}:{y}",
-            x=int(x),
-            y=int(y),
-            role=role,
-            dual_rail_state=DualRailState.LOGICAL_01,
-            readout_confidence=1.0,
-            syndrome_parity=True,
-        )
-    )
 
 
 def generate_stim_assisted_events(
@@ -418,7 +616,13 @@ def generate_stim_assisted_events(
     detector_coordinates: dict[int, tuple[float, ...]] | None = None,
     erasure_sidecar: ErasureSidecarBatch | None = None,
 ) -> list[HardwareEvent]:
-    """Convert one sampled Stim shot into hardware-style telemetry events."""
+    """Convert one sampled Stim shot into hardware-style telemetry events.
+
+    The detector row is assumed to already include any erasure-induced physical
+    effects when generated through ``sample_per_erasure_stim_shot``. The sidecar
+    therefore adds observed erasure telemetry only; it does not fabricate extra
+    syndrome events.
+    """
     geometry = SurfacePatchGeometry(distance=int(distance))
     events: list[HardwareEvent] = []
     detector_coordinates = detector_coordinates or {}
@@ -480,60 +684,56 @@ def generate_stim_assisted_events(
                             syndrome_parity=None,
                         )
                     )
-                    coupled_rounds = [t]
-                    if t + 1 < int(rounds):
-                        coupled_rounds.append(t + 1)
-
-                    if bool(data[t, x, y]):
-                        for cx, cy, c_role in _neighbor_measure_sites(geometry, x, y, basis):
-                            for c_round in coupled_rounds:
-                                _add_syndrome_event(
-                                    events,
-                                    basis=basis,
-                                    round_id=c_round,
-                                    x=cx,
-                                    y=cy,
-                                    role=c_role,
-                                    reason="data_erasure",
-                                )
-                    if bool(meas[t, x, y]):
-                        c_role = role if role != QubitRole.DATA else _detector_role_for_grid(geometry, x, y, basis)
-                        for c_round in coupled_rounds:
-                            _add_syndrome_event(
-                                events,
-                                basis=basis,
-                                round_id=c_round,
-                                x=x,
-                                y=y,
-                                role=c_role,
-                                reason="measure_erasure",
-                            )
 
     return events
 
 
-def logical_erasure_parity(
-    sidecar: ErasureSidecarBatch,
-    shot_index: int,
-) -> int:
-    """Central-strip parity proxy for erasure-induced logical changes."""
-    data = np.asarray(sidecar.data_erasures[int(shot_index)], dtype=np.uint8)
-    meas = np.asarray(sidecar.measure_erasures[int(shot_index)], dtype=np.uint8)
-    _, h, w = data.shape
-    mid_x = h // 2
-    mid_y = w // 2
-    if str(sidecar.basis).strip().upper() == "X":
-        parity_source = data[:, :, mid_y] + meas[:, :, mid_y]
-    else:
-        parity_source = data[:, mid_x, :] + meas[:, mid_x, :]
-    return int(np.sum(parity_source) % 2)
-
-
 def pack_erasure_sidecar(sidecar: ErasureSidecarBatch) -> dict[str, np.ndarray]:
     """Pack sidecar arrays for scalable shard storage."""
+    physical_data = (
+        sidecar.physical_data_erasures
+        if sidecar.physical_data_erasures is not None
+        else sidecar.data_erasures
+    )
+    physical_measure = (
+        sidecar.physical_measure_erasures
+        if sidecar.physical_measure_erasures is not None
+        else sidecar.measure_erasures
+    )
+    false_positive_data = (
+        sidecar.false_positive_data
+        if sidecar.false_positive_data is not None
+        else np.zeros_like(sidecar.data_erasures)
+    )
+    false_positive_measure = (
+        sidecar.false_positive_measure
+        if sidecar.false_positive_measure is not None
+        else np.zeros_like(sidecar.measure_erasures)
+    )
+    false_negative_data = (
+        sidecar.false_negative_data
+        if sidecar.false_negative_data is not None
+        else np.zeros_like(sidecar.data_erasures)
+    )
+    false_negative_measure = (
+        sidecar.false_negative_measure
+        if sidecar.false_negative_measure is not None
+        else np.zeros_like(sidecar.measure_erasures)
+    )
+
+    def pack(mask: np.ndarray) -> np.ndarray:
+        mask = np.asarray(mask, dtype=np.uint8)
+        return np.packbits(mask.reshape(mask.shape[0], -1), axis=1)
+
     return {
-        "data_erasures": np.packbits(sidecar.data_erasures.reshape(sidecar.data_erasures.shape[0], -1), axis=1),
-        "measure_erasures": np.packbits(sidecar.measure_erasures.reshape(sidecar.measure_erasures.shape[0], -1), axis=1),
+        "data_erasures": pack(sidecar.data_erasures),
+        "measure_erasures": pack(sidecar.measure_erasures),
+        "physical_data_erasures": pack(physical_data),
+        "physical_measure_erasures": pack(physical_measure),
+        "false_positive_data": pack(false_positive_data),
+        "false_positive_measure": pack(false_positive_measure),
+        "false_negative_data": pack(false_negative_data),
+        "false_negative_measure": pack(false_negative_measure),
         "readout_ambiguity": sidecar.readout_ambiguity.astype(np.float32, copy=False),
         "shape": np.asarray(sidecar.data_erasures.shape, dtype=np.int64),
     }

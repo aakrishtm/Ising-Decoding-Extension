@@ -16,7 +16,8 @@ from dual_rail_qec.decoding.residual import (
 )
 from dual_rail_qec.models.cnn3d_predecoder import DualRailCNN3DPreDecoder
 from dual_rail_qec.training.metrics import (
-    binary_precision_recall,
+    binary_confusion_counts,
+    binary_summary_from_counts,
     logical_error_rate,
     syndrome_density,
 )
@@ -46,8 +47,7 @@ def evaluate(
     ds = DualRailTorchDataset(dataset_dir)
     loader = DataLoader(ds, batch_size=int(batch_size), shuffle=False)
 
-    total_precision = 0.0
-    total_recall = 0.0
+    counts = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
     total_ler = 0.0
     total_before = 0.0
     total_after = 0.0
@@ -62,20 +62,25 @@ def evaluate(
             residual = residual_syndrome_inputs(inputs, candidates)
             predicted_logicals = logical_prediction_from_corrections(candidates)
 
-            pr = binary_precision_recall(logits, targets, threshold=threshold)
-            total_precision += pr["precision"]
-            total_recall += pr["recall"]
+            batch_counts = binary_confusion_counts(logits, targets, threshold=threshold)
+            for key, value in batch_counts.items():
+                counts[key] += int(value)
             total_ler += logical_error_rate(predicted_logicals, labels)
             total_before += syndrome_density(inputs)
             total_after += syndrome_density(residual)
             batches += 1
 
+    pr = binary_summary_from_counts(**counts)
     metrics = {
-        "precision": total_precision / max(batches, 1),
-        "recall": total_recall / max(batches, 1),
+        "precision": pr["precision"],
+        "recall": pr["recall"],
+        "f1": pr["f1"],
+        "target_density": pr["target_density"],
+        "prediction_density": pr["prediction_density"],
         "logical_error_rate": total_ler / max(batches, 1),
         "syndrome_density_before": total_before / max(batches, 1),
         "syndrome_density_after": total_after / max(batches, 1),
+        "threshold": float(threshold),
     }
     return {k: float(v) for k, v in metrics.items()}
 

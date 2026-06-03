@@ -1,0 +1,57 @@
+{
+  "artifact": "dual_rail_qec_per_erasure_stim_dataset",
+  "bases": [
+    "X",
+    "Z"
+  ],
+  "coupling_rule": "Per-erasure Stim circuit conversion: true erasure events are sampled first, then converted into deterministic Pauli error instructions in a per-shot Stim circuit. Detector and logical samples are taken from that modified circuit, while the observed erasure detections are preserved as telemetry. False positives appear only in telemetry; false negatives affect the circuit without appearing in telemetry.",
+  "data_source": "stim",
+  "distance": 3,
+  "format": {
+    "compressed_npz": false,
+    "inputs": "float32[N,7,T,H,W]",
+    "logical_labels": "uint8[N,1]",
+    "targets": "float32[N,4,T,H,W]"
+  },
+  "injection_rule": "No measurement-producing erasure instruction is injected into the Stim circuit. For each sampled erasure pattern, deterministic Pauli error instructions X_ERROR(1), Y_ERROR(1), or Z_ERROR(1) are inserted at non-measurement-producing spacetime locations. This preserves DETECTOR/OBSERVABLE rec offsets.",
+  "input_shape": [
+    7,
+    3,
+    3,
+    3
+  ],
+  "logical_label_rule": "Stim observable parity sampled from per-erasure modified circuits",
+  "noise": {
+    "p_ambiguity": 0.0,
+    "p_erasure": 0.05,
+    "p_false_negative": 0.02,
+    "p_false_positive": 0.01,
+    "p_measure": 0.002,
+    "p_pauli": 0.01
+  },
+  "num_samples": 2000,
+  "num_shards": 2,
+  "rounds": 3,
+  "samples_per_shard": 1000,
+  "schema_version": 1,
+  "seed": 0,
+  "sidecars": {
+    "detector_samples": [
+      "samples_X.dets",
+      "samples_Z.dets"
+    ],
+    "erasure_layout": "root NPZ manifests point to per-shard erasure sidecars; each sidecar is aligned as shot, round, grid-x, grid-y",
+    "erasures": [
+      "erasures_X.npz",
+      "erasures_Z.npz"
+    ]
+  },
+  "stim_version": "1.16.0",
+  "target_shape": [
+    4,
+    3,
+    3,
+    3
+  ],
+  "warning": "per-erasure Stim approximation; true erasures are converted into deterministic Pauli error instructions that affect Stim detectors/logicals, while observed erasure telemetry is stored separately. This is not a calibrated cavity hardware model."
+}

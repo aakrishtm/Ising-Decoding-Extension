@@ -6,20 +6,16 @@ The default path writes the project's pre-generated NPZ shard dataset:
     datasets/dual_rail_d{distance}/metadata.json
     datasets/dual_rail_d{distance}/shards/shard_00000.npz
 
-The Stim detector-sample path is intentionally still a stub until the exact
-dual-rail circuit model is approved.
+When Stim is available, the generator also writes sparse detector samples:
+
+    datasets/dual_rail_d{distance}/samples_X.dets
+    datasets/dual_rail_d{distance}/samples_Z.dets
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
-import json
-import os
 from pathlib import Path
-from typing import Any, Dict
-
-import numpy as np
 
 try:
     import stim
@@ -27,56 +23,23 @@ except ImportError:
     stim = None
 
 from dual_rail_qec.data.export import write_dataset
+from dual_rail_qec.data.simulator import build_base_surface_code_circuit
 
 
 def build_dual_rail_circuit(d, rounds, p_erasure, p_pauli):
-    """Build a surface-code memory circuit with dual-rail erasure boundaries.
+    """Build the basis-specific base Stim circuits used by the dual-rail writer.
 
-    The eventual implementation should construct a rotated surface-code memory
-    experiment for the requested code distance and number of syndrome rounds,
-    inject explicit dual-rail erasure events at rate ``p_erasure``, inject any
-    residual Pauli noise at rate ``p_pauli``, and expose erasure locations in a
-    form that can be converted into the pre-decoder's extra input channel.
-
-    The body is deliberately left unimplemented during the reconnaissance phase.
+    Erasures are sampled per shot and converted into probability-one Pauli error
+    instructions by ``write_dataset``. They are not inserted as measurement
+    instructions here, so Stim ``DETECTOR`` and ``OBSERVABLE_INCLUDE`` rec
+    offsets stay valid.
     """
     if stim is None:
         raise RuntimeError("stim is required for dual-rail circuit generation.")
-    raise NotImplementedError("Dual-rail Stim circuit generation is not implemented yet.")
-
-
-def _metadata_for_basis(
-    *,
-    basis: str,
-    distance: int,
-    rounds: int,
-    num_shots: int,
-    p_erasure: float,
-    p_pauli: float,
-    circuit: stim.Circuit | None,
-) -> Dict[str, Any]:
-    """Return metadata compatible with NVIDIA's offline Stim sample contract."""
-    circuit_text = "" if circuit is None else str(circuit)
-    circuit_sha256 = hashlib.sha256(circuit_text.encode("utf-8")).hexdigest()
+    _ = p_erasure
     return {
-        "schema_version": 2,
-        "artifact": "stim_detector_samples",
-        "format": "dets",
-        "append_observables": True,
-        "distance": distance,
-        "n_rounds": rounds,
-        "basis": basis,
-        "code_rotation": "O1",
-        "num_detectors": None,
-        "num_observables": None,
-        "num_shots": num_shots,
-        "p_error": p_pauli,
-        "noise_model": "dual-rail-erasure-stub",
-        "noise_model_sha256": circuit_sha256,
-        "noise_model_params": {
-            "p_erasure": p_erasure,
-            "p_pauli": p_pauli,
-        },
+        "X": build_base_surface_code_circuit(d, rounds, "X", p_pauli),
+        "Z": build_base_surface_code_circuit(d, rounds, "Z", p_pauli),
     }
 
 
@@ -88,42 +51,30 @@ def write_offline_samples(
     num_shots: int,
     p_erasure: float,
     p_pauli: float,
-) -> None:
-    """Outline the offline Stim sample outputs expected by the NVIDIA pipeline."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # TODO: Build separate memory circuits for X and Z bases if the final dual-
-    # rail construction requires basis-specific detector layouts.
-    circuit = None
-
-    expected_outputs = {
-        "X": output_dir / "samples_X.dets",
-        "Z": output_dir / "samples_Z.dets",
-    }
-    metadata = {
-        basis: _metadata_for_basis(
-            basis=basis,
-            distance=distance,
-            rounds=rounds,
-            num_shots=num_shots,
-            p_erasure=p_erasure,
-            p_pauli=p_pauli,
-            circuit=circuit,
-        )
-        for basis in expected_outputs
-    }
-
-    # TODO: Replace this placeholder with Stim sampler output in sparse .dets
-    # format with logical observables appended.
-    for path in expected_outputs.values():
-        path.touch(exist_ok=True)
-
-    with (output_dir / "metadata.json").open("w", encoding="utf-8") as f:
-        json.dump(metadata, f, indent=2, sort_keys=True)
-        f.write(os.linesep)
-
-    raise NotImplementedError(
-        "Output paths and metadata scaffold were created, but sample generation is not implemented."
+    p_measure: float,
+    p_false_positive: float,
+    p_false_negative: float,
+    p_ambiguity: float,
+    seed: int,
+    compress: bool,
+) -> Path:
+    """Write one Stim-backed dataset shard with NVIDIA-style ``.dets`` files."""
+    return write_dataset(
+        output_root=output_dir,
+        distance=distance,
+        rounds=rounds,
+        num_shards=1,
+        samples_per_shard=num_shots,
+        p_erasure=p_erasure,
+        p_pauli=p_pauli,
+        p_measure=p_measure,
+        p_false_positive=p_false_positive,
+        p_false_negative=p_false_negative,
+        p_ambiguity=p_ambiguity,
+        seed=seed,
+        data_source="stim",
+        bases=("X", "Z"),
+        compress=compress,
     )
 
 
@@ -135,40 +86,50 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rounds", "--n-rounds", dest="rounds", type=int, required=True, help="Syndrome rounds.")
     parser.add_argument("--p-erasure", type=float, default=0.0, help="Dual-rail erasure probability.")
     parser.add_argument("--p-pauli", type=float, default=0.0, help="Residual Pauli error probability.")
+    parser.add_argument("--p-measure", type=float, default=0.0, help="Stim measurement-flip probability.")
+    parser.add_argument("--p-false-positive", type=float, default=0.0, help="Erasure flag fires without physical erasure.")
+    parser.add_argument("--p-false-negative", type=float, default=0.0, help="Physical erasure is missed by telemetry.")
     parser.add_argument("--p-ambiguity", type=float, default=0.0, help="Ambiguous readout probability.")
     parser.add_argument("--num-shards", type=int, default=1, help="Number of NPZ shards to write.")
     parser.add_argument("--samples-per-shard", type=int, default=1024, help="Samples in each NPZ shard.")
     parser.add_argument("--seed", type=int, default=0, help="Random seed for deterministic generation.")
-    parser.add_argument("--num-shots", type=int, default=262144, help="Number of detector-sample shots for stim-stub mode.")
+    parser.add_argument("--num-shots", type=int, default=262144, help="Number of detector-sample shots for stim-samples mode.")
     parser.add_argument("--data-source", choices=("auto", "stim", "synthetic"), default="auto")
     parser.add_argument("--basis", action="append", choices=("X", "Z"), default=None)
     parser.add_argument("--compress", action="store_true", help="Use compressed NPZ output.")
     parser.add_argument(
         "--artifact",
-        choices=("dataset", "stim-stub"),
+        choices=("dataset", "stim-samples", "stim-stub"),
         default="dataset",
-        help="Write NPZ dataset shards, or create the legacy Stim sample stub outputs.",
+        help="Write NPZ dataset shards, or write one Stim-backed shard with samples_X/Z.dets.",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("datasets"),
-        help="Dataset output root, or Stim sample directory in stim-stub mode.",
+        help="Dataset output root, or Stim sample output root in stim-samples mode.",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    if args.artifact == "stim-stub":
-        write_offline_samples(
+    if args.artifact in {"stim-samples", "stim-stub"}:
+        dataset_dir = write_offline_samples(
             output_dir=args.output_dir,
             distance=args.distance,
             rounds=args.rounds,
             num_shots=args.num_shots,
             p_erasure=args.p_erasure,
             p_pauli=args.p_pauli,
+            p_measure=args.p_measure,
+            p_false_positive=args.p_false_positive,
+            p_false_negative=args.p_false_negative,
+            p_ambiguity=args.p_ambiguity,
+            seed=args.seed,
+            compress=args.compress,
         )
+        print(f"Wrote dual-rail Stim samples: {dataset_dir}")
         return
 
     dataset_dir = write_dataset(
@@ -179,6 +140,9 @@ def main() -> None:
         samples_per_shard=args.samples_per_shard,
         p_erasure=args.p_erasure,
         p_pauli=args.p_pauli,
+        p_measure=args.p_measure,
+        p_false_positive=args.p_false_positive,
+        p_false_negative=args.p_false_negative,
         p_ambiguity=args.p_ambiguity,
         seed=args.seed,
         data_source=args.data_source,

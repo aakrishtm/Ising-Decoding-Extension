@@ -11,14 +11,15 @@ import numpy as np
 
 from dual_rail_qec.data.simulator import (
     COUPLING_RULE,
+    ErasureNoiseModel,
     INJECTION_RULE,
+    build_base_surface_code_circuit,
     generate_erasure_sidecar,
     generate_synthetic_events,
     generate_stim_assisted_events,
-    logical_erasure_parity,
     logical_label_from_targets,
     pack_erasure_sidecar,
-    sample_stim_basis,
+    sample_per_erasure_stim_shot,
     stim,
 )
 from dual_rail_qec.telemetry.tensorize import NUM_INPUT_CHANNELS, make_local_targets, tensorize_events
@@ -35,6 +36,9 @@ def build_dataset_metadata(
     samples_per_shard: int,
     p_erasure: float,
     p_pauli: float,
+    p_measure: float,
+    p_false_positive: float,
+    p_false_negative: float,
     p_ambiguity: float,
     seed: int,
     data_source: str,
@@ -45,7 +49,7 @@ def build_dataset_metadata(
     stim_version = None if stim is None else getattr(stim, "__version__", "unknown")
     return {
         "schema_version": 1,
-        "artifact": "dual_rail_qec_stim_coupled_dataset" if source == "stim" else "dual_rail_qec_dataset",
+        "artifact": "dual_rail_qec_per_erasure_stim_dataset" if source == "stim" else "dual_rail_qec_dataset",
         "data_source": source,
         "stim_version": stim_version,
         "distance": int(distance),
@@ -55,24 +59,27 @@ def build_dataset_metadata(
         "num_shards": int(num_shards),
         "samples_per_shard": int(samples_per_shard),
         "num_samples": int(num_shards) * int(samples_per_shard),
-        "noise": {
-            "p_erasure": float(p_erasure),
-            "p_pauli": float(p_pauli),
-            "p_ambiguity": float(p_ambiguity),
-        },
+        "noise": ErasureNoiseModel(
+            p_erasure=p_erasure,
+            p_pauli=p_pauli,
+            p_measure=p_measure,
+            p_false_positive=p_false_positive,
+            p_false_negative=p_false_negative,
+            p_ambiguity=p_ambiguity,
+        ).to_dict(),
         "seed": int(seed),
         "bases": list(bases),
         "injection_rule": INJECTION_RULE if source == "stim" else None,
         "coupling_rule": COUPLING_RULE if source == "stim" else None,
         "logical_label_rule": (
-            "Stim observable parity XOR central-strip erasure parity proxy"
+            "Stim observable parity sampled from per-erasure modified circuits"
             if source == "stim"
             else "synthetic target parity proxy"
         ),
         "warning": (
-            "first-pass Stim-assisted dual-rail approximation; erasures are explicit "
-            "sidecar telemetry and are causally coupled at the phenomenological "
-            "detector/target layer, not an exact cavity hardware model"
+            "per-erasure Stim approximation; true erasures are converted into deterministic "
+            "Pauli error instructions that affect Stim detectors/logicals, while observed "
+            "erasure telemetry is stored separately. This is not a calibrated cavity hardware model."
             if source == "stim"
             else "synthetic schema exerciser; not Stim surface-code dynamics"
         ),
@@ -142,23 +149,22 @@ def _append_dets(path: Path, detector_samples: np.ndarray, observables: np.ndarr
 
 
 def _logical_label_from_observables(
-    batches: dict[str, Any],
-    sidecars: dict[str, Any],
+    observables_by_basis: dict[str, np.ndarray],
     sample_idx: int,
 ) -> np.ndarray:
     label = 0
-    used_observable = False
-    for batch in batches.values():
-        obs = np.asarray(batch.observables, dtype=np.uint8)
+    for rows in observables_by_basis.values():
+        obs = np.asarray(rows, dtype=np.uint8)
         if obs.size == 0:
             continue
-        used_observable = True
         label ^= int(np.sum(obs[int(sample_idx)].reshape(-1)) % 2)
-    for sidecar in sidecars.values():
-        label ^= logical_erasure_parity(sidecar, sample_idx)
-    if not used_observable:
-        return np.asarray([label], dtype=np.uint8)
     return np.asarray([label], dtype=np.uint8)
+
+
+def _stack_bit_rows(rows: list[np.ndarray]) -> np.ndarray:
+    if not rows:
+        return np.zeros((0, 0), dtype=np.uint8)
+    return np.vstack([np.asarray(row, dtype=np.uint8).reshape(1, -1) for row in rows])
 
 
 def write_dataset(
@@ -170,6 +176,9 @@ def write_dataset(
     samples_per_shard: int,
     p_erasure: float,
     p_pauli: float,
+    p_measure: float = 0.0,
+    p_false_positive: float = 0.0,
+    p_false_negative: float = 0.0,
     p_ambiguity: float = 0.0,
     seed: int = 0,
     data_source: str = "auto",
@@ -193,6 +202,9 @@ def write_dataset(
         samples_per_shard=samples_per_shard,
         p_erasure=p_erasure,
         p_pauli=p_pauli,
+        p_measure=p_measure,
+        p_false_positive=p_false_positive,
+        p_false_negative=p_false_negative,
         p_ambiguity=p_ambiguity,
         seed=seed,
         data_source=source,
@@ -205,8 +217,22 @@ def write_dataset(
 
     rng = np.random.default_rng(int(seed))
     erasure_manifest: dict[str, dict[str, Any]] = {}
+    stim_base_circuits: dict[str, Any] = {}
+    detector_coordinates_by_basis: dict[str, dict[int, tuple[float, ...]]] = {}
     if source == "stim":
         for basis in basis_tuple:
+            base_circuit = build_base_surface_code_circuit(
+                distance=distance,
+                rounds=rounds,
+                basis=basis,
+                p_pauli=p_pauli,
+                p_measure=p_measure,
+            )
+            stim_base_circuits[basis] = base_circuit
+            detector_coordinates_by_basis[basis] = {
+                int(k): tuple(float(v_i) for v_i in v)
+                for k, v in base_circuit.get_detector_coordinates().items()
+            }
             samples_path = dataset_dir / f"samples_{basis}.dets"
             samples_path.write_text("", encoding="utf-8")
             erasure_manifest[basis] = {"shard_files": [], "site_records": None}
@@ -222,33 +248,44 @@ def write_dataset(
         )
         logical_labels = np.zeros((int(samples_per_shard), 1), dtype=np.uint8)
 
-        stim_batches = {}
+        detector_samples_by_basis: dict[str, np.ndarray] = {}
+        observables_by_basis: dict[str, np.ndarray] = {}
         erasure_sidecars = {}
         if source == "stim":
             for basis in basis_tuple:
-                batch = sample_stim_basis(
-                    distance=distance,
-                    rounds=rounds,
-                    basis=basis,
-                    num_shots=samples_per_shard,
-                    p_pauli=p_pauli,
-                    seed=int(seed) + shard_idx * 1009 + (17 if basis == "X" else 29),
-                )
-                stim_batches[basis] = batch
                 erasure_sidecar = generate_erasure_sidecar(
                     distance=distance,
                     rounds=rounds,
                     num_shots=samples_per_shard,
                     p_erasure=p_erasure,
                     p_ambiguity=p_ambiguity,
+                    p_false_positive=p_false_positive,
+                    p_false_negative=p_false_negative,
                     basis=basis,
                     rng=np.random.default_rng(int(seed) + shard_idx * 1009 + (101 if basis == "X" else 211)),
                 )
                 erasure_sidecars[basis] = erasure_sidecar
+                det_rows = []
+                obs_rows = []
+                base_circuit = stim_base_circuits[basis]
+                basis_offset = 17 if basis == "X" else 29
+                for sample_idx in range(int(samples_per_shard)):
+                    det_row, obs_row = sample_per_erasure_stim_shot(
+                        base_circuit,
+                        sidecar=erasure_sidecar,
+                        shot_index=sample_idx,
+                        distance=distance,
+                        rounds=rounds,
+                        seed=int(seed) + shard_idx * 1000003 + sample_idx * 9176 + basis_offset,
+                    )
+                    det_rows.append(det_row)
+                    obs_rows.append(obs_row)
+                detector_samples_by_basis[basis] = _stack_bit_rows(det_rows)
+                observables_by_basis[basis] = _stack_bit_rows(obs_rows)
                 _append_dets(
                     dataset_dir / f"samples_{basis}.dets",
-                    batch.detector_samples,
-                    batch.observables,
+                    detector_samples_by_basis[basis],
+                    observables_by_basis[basis],
                 )
                 erasure_shard_name = f"erasures_{basis}_shard_{shard_idx:05d}.npz"
                 packed_sidecar = pack_erasure_sidecar(erasure_sidecar)
@@ -266,15 +303,15 @@ def write_dataset(
         for sample_idx in range(int(samples_per_shard)):
             if source == "stim":
                 events = []
-                for basis, batch in stim_batches.items():
+                for basis in basis_tuple:
                     events.extend(
                         generate_stim_assisted_events(
                             distance=distance,
                             rounds=rounds,
                             shot_index=sample_idx,
-                            detector_samples=batch.detector_samples,
+                            detector_samples=detector_samples_by_basis[basis],
                             basis=basis,
-                            detector_coordinates=batch.detector_coordinates,
+                            detector_coordinates=detector_coordinates_by_basis[basis],
                             erasure_sidecar=erasure_sidecars[basis],
                         )
                     )
@@ -292,7 +329,7 @@ def write_dataset(
             inputs[sample_idx] = sample_inputs
             targets[sample_idx] = sample_targets
             logical_labels[sample_idx] = (
-                _logical_label_from_observables(stim_batches, erasure_sidecars, sample_idx)
+                _logical_label_from_observables(observables_by_basis, sample_idx)
                 if source == "stim"
                 else logical_label_from_targets(sample_targets)
             )
@@ -333,6 +370,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--samples-per-shard", type=int, default=1024)
     parser.add_argument("--p-erasure", type=float, default=0.01)
     parser.add_argument("--p-pauli", type=float, default=0.001)
+    parser.add_argument("--p-measure", type=float, default=0.0)
+    parser.add_argument("--p-false-positive", type=float, default=0.0)
+    parser.add_argument("--p-false-negative", type=float, default=0.0)
     parser.add_argument("--p-ambiguity", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--data-source", choices=("auto", "stim", "synthetic"), default="auto")
@@ -351,6 +391,9 @@ def main() -> None:
         samples_per_shard=args.samples_per_shard,
         p_erasure=args.p_erasure,
         p_pauli=args.p_pauli,
+        p_measure=args.p_measure,
+        p_false_positive=args.p_false_positive,
+        p_false_negative=args.p_false_negative,
         p_ambiguity=args.p_ambiguity,
         seed=args.seed,
         data_source=args.data_source,

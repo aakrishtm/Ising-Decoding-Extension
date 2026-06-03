@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader, Dataset
 from dual_rail_qec.data.datasets import DualRailShardDataset
 from dual_rail_qec.models.cnn3d_predecoder import DualRailCNN3DPreDecoder
 from dual_rail_qec.models.losses import local_fault_bce_loss
-from dual_rail_qec.training.metrics import binary_precision_recall
+from dual_rail_qec.training.metrics import binary_confusion_counts, binary_summary_from_counts
 
 
 class DualRailTorchDataset(Dataset):
@@ -47,6 +47,8 @@ def train(
     shuffle: bool = False,
     precision: str = "auto",
     device: str | None = None,
+    pos_weight: float | None = None,
+    threshold: float = 0.5,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     ds = DualRailTorchDataset(dataset_dir)
@@ -67,22 +69,24 @@ def train(
         precision_norm = "bf16" if dev.type == "cuda" else "fp32"
     amp_enabled = dev.type == "cuda" and precision_norm in {"bf16", "fp16"}
     amp_dtype = torch.bfloat16 if precision_norm == "bf16" else torch.float16
-    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled and precision_norm == "fp16")
+    try:
+        scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled and precision_norm == "fp16")
+    except (AttributeError, TypeError):
+        scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled and precision_norm == "fp16")
 
     history = []
     for epoch in range(int(epochs)):
         model.train()
         total_loss = 0.0
         total_batches = 0
-        last_logits = None
-        last_targets = None
+        counts = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
         for batch in loader:
             inputs = batch["inputs"].to(dev)
             targets = batch["targets"].to(dev)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=dev.type, dtype=amp_dtype, enabled=amp_enabled):
                 logits = model(inputs)
-                loss = local_fault_bce_loss(logits, targets)
+                loss = local_fault_bce_loss(logits, targets, pos_weight=pos_weight)
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -92,13 +96,16 @@ def train(
                 optimizer.step()
             total_loss += float(loss.item())
             total_batches += 1
-            last_logits = logits.detach()
-            last_targets = targets.detach()
+            with torch.no_grad():
+                batch_counts = binary_confusion_counts(logits.detach(), targets.detach(), threshold=threshold)
+            for key, value in batch_counts.items():
+                counts[key] += int(value)
 
-        metrics = binary_precision_recall(last_logits, last_targets) if last_logits is not None else {}
+        metrics = binary_summary_from_counts(**counts)
         record = {
             "epoch": epoch + 1,
             "loss": total_loss / max(total_batches, 1),
+            "threshold": float(threshold),
             **metrics,
         }
         history.append(record)
@@ -115,6 +122,8 @@ def train(
             "depth": int(depth),
             "kernel_size": 3,
             "precision": precision_norm,
+            "pos_weight": None if pos_weight is None else float(pos_weight),
+            "threshold": float(threshold),
         },
         "history": history,
     }
@@ -137,6 +146,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shuffle", action="store_true", help="Global sample shuffle; slower for very large NPZ shard sets.")
     parser.add_argument("--precision", choices=("auto", "fp32", "bf16", "fp16"), default="auto")
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--pos-weight", type=float, default=None, help="Positive-class BCE weight for sparse local targets.")
+    parser.add_argument("--threshold", type=float, default=0.5, help="Sigmoid threshold for reported precision/recall.")
     return parser.parse_args()
 
 
@@ -154,6 +165,8 @@ def main() -> None:
         shuffle=args.shuffle,
         precision=args.precision,
         device=args.device,
+        pos_weight=args.pos_weight,
+        threshold=args.threshold,
     )
     print(f"Wrote checkpoint: {checkpoint}")
 
