@@ -1,4 +1,4 @@
-"""Evaluate PyMatching with optional CNN-guided erasure edge weighting."""
+"""Evaluate erasure-aware PyMatching regimes for dual-rail datasets."""
 
 from __future__ import annotations
 
@@ -6,29 +6,80 @@ import argparse
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import numpy as np
 import pymatching
+import stim
 import torch
 
 from dual_rail_qec.data.datasets import DualRailShardDataset
 from dual_rail_qec.data.simulator import (
+    ErasureSidecarBatch,
     build_base_surface_code_circuit,
-    _coord_bounds_from_map,
-    _grid_coord_from_stim,
+    extract_stim_qubit_layout,
+    generate_stim_assisted_events,
+    _detector_role_for_grid,
+    _nearest_site,
+    _round_to_tick,
+    _tick_count,
 )
 from dual_rail_qec.models.cnn3d_predecoder import DualRailCNN3DPreDecoder
+from dual_rail_qec.telemetry.geometry import SurfacePatchGeometry
+from dual_rail_qec.telemetry.schema import QubitRole
+from dual_rail_qec.telemetry.tensorize import tensorize_events
+
+
+Signature = tuple[stim.DemTarget, ...]
+OracleMap = dict[tuple[int, int], list[Signature]]
 
 
 @dataclass(frozen=True)
-class DetectorSite:
-    """Dense-grid location for one Stim detector."""
+class BasisSidecar:
+    """Basis-specific erasure masks unpacked from sidecar shards."""
 
-    detector_id: int
-    round_id: int
-    x: int
-    y: int
+    basis: str
+    data_erasures: np.ndarray
+    measure_erasures: np.ndarray
+    physical_data_erasures: np.ndarray
+    physical_measure_erasures: np.ndarray
+    readout_ambiguity: np.ndarray
+
+    def observed_mask(self) -> tuple[np.ndarray, np.ndarray]:
+        return self.data_erasures, self.measure_erasures
+
+    def physical_mask(self) -> tuple[np.ndarray, np.ndarray]:
+        return self.physical_data_erasures, self.physical_measure_erasures
+
+
+@dataclass
+class InjectionDiagnostics:
+    """Counters describing how erasure masks mapped into oracle signatures."""
+
+    mask_locations: int = 0
+    missing_erased_locations: int = 0
+    oracle_lookup_hits: int = 0
+    oracle_lookup_misses: int = 0
+    injected_signatures: int = 0
+
+    def add(self, other: "InjectionDiagnostics") -> None:
+        self.mask_locations += other.mask_locations
+        self.missing_erased_locations += other.missing_erased_locations
+        self.oracle_lookup_hits += other.oracle_lookup_hits
+        self.oracle_lookup_misses += other.oracle_lookup_misses
+        self.injected_signatures += other.injected_signatures
+
+    def to_metrics(self, shots: int) -> dict[str, float]:
+        denom = max(int(shots), 1)
+        return {
+            "mask_locations": float(self.mask_locations),
+            "missing_erased_locations": float(self.missing_erased_locations),
+            "oracle_lookup_hits": float(self.oracle_lookup_hits),
+            "oracle_lookup_misses": float(self.oracle_lookup_misses),
+            "injected_signatures": float(self.injected_signatures),
+            "mean_mask_locations_per_shot": float(self.mask_locations / denom),
+            "mean_injected_signatures_per_shot": float(self.injected_signatures / denom),
+        }
 
 
 def _noise_value(metadata: dict[str, Any], key: str, default: float = 0.0) -> float:
@@ -36,6 +87,50 @@ def _noise_value(metadata: dict[str, Any], key: str, default: float = 0.0) -> fl
     if isinstance(noise, dict) and key in noise:
         return float(noise[key])
     return float(metadata.get(key, default))
+
+
+def unpack_packed_mask(packed: np.ndarray, shape: Iterable[int]) -> np.ndarray:
+    """Unpack a sidecar mask stored as per-shot ``np.packbits`` rows."""
+    shape_tuple = tuple(int(v) for v in shape)
+    flat_width = int(np.prod(shape_tuple[1:]))
+    unpacked = np.unpackbits(np.asarray(packed, dtype=np.uint8), axis=1, count=flat_width)
+    return unpacked.reshape(shape_tuple).astype(np.uint8)
+
+
+def load_basis_sidecar(dataset_dir: Path, basis: str) -> BasisSidecar:
+    """Load all per-shard sidecar masks for one basis."""
+    basis_norm = str(basis).strip().upper()
+    manifest_path = Path(dataset_dir) / f"erasures_{basis_norm}.npz"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Missing basis sidecar manifest: {manifest_path}")
+    with np.load(manifest_path, allow_pickle=True) as manifest:
+        shard_files = [str(v) for v in manifest["shard_files"]]
+
+    arrays: dict[str, list[np.ndarray]] = {
+        "data_erasures": [],
+        "measure_erasures": [],
+        "physical_data_erasures": [],
+        "physical_measure_erasures": [],
+        "readout_ambiguity": [],
+    }
+    for rel_path in shard_files:
+        shard_path = Path(dataset_dir) / rel_path
+        with np.load(shard_path, allow_pickle=True) as shard:
+            shape = tuple(int(v) for v in shard["shape"])
+            arrays["data_erasures"].append(unpack_packed_mask(shard["data_erasures"], shape))
+            arrays["measure_erasures"].append(unpack_packed_mask(shard["measure_erasures"], shape))
+            arrays["physical_data_erasures"].append(unpack_packed_mask(shard["physical_data_erasures"], shape))
+            arrays["physical_measure_erasures"].append(unpack_packed_mask(shard["physical_measure_erasures"], shape))
+            arrays["readout_ambiguity"].append(np.asarray(shard["readout_ambiguity"], dtype=np.float32))
+
+    return BasisSidecar(
+        basis=basis_norm,
+        data_erasures=np.concatenate(arrays["data_erasures"], axis=0),
+        measure_erasures=np.concatenate(arrays["measure_erasures"], axis=0),
+        physical_data_erasures=np.concatenate(arrays["physical_data_erasures"], axis=0),
+        physical_measure_erasures=np.concatenate(arrays["physical_measure_erasures"], axis=0),
+        readout_ambiguity=np.concatenate(arrays["readout_ambiguity"], axis=0),
+    )
 
 
 def _parse_sparse_dets(path: Path, *, num_detectors: int, num_observables: int) -> tuple[np.ndarray, np.ndarray]:
@@ -77,27 +172,109 @@ def _parse_sparse_dets(path: Path, *, num_detectors: int, num_observables: int) 
     return np.vstack(det_rows), np.vstack(obs_rows)
 
 
-def _detector_sites(circuit, *, distance: int, rounds: int) -> list[DetectorSite]:
-    detector_coordinates = {
-        int(k): tuple(float(v_i) for v_i in v)
-        for k, v in circuit.get_detector_coordinates().items()
-    }
-    detector_xy = {
-        idx: (coords[0], coords[1])
-        for idx, coords in detector_coordinates.items()
-        if len(coords) >= 2
-    }
-    bounds = _coord_bounds_from_map(detector_xy)
-    sites: list[DetectorSite] = []
-    for detector_id in range(int(circuit.num_detectors)):
-        coords = detector_coordinates.get(detector_id, ())
-        stim_x = coords[0] if len(coords) >= 1 else None
-        stim_y = coords[1] if len(coords) >= 2 else None
-        stim_t = coords[2] if len(coords) >= 3 else 0
-        x, y = _grid_coord_from_stim(stim_x, stim_y, distance=distance, bounds=bounds)
-        t = max(0, min(int(rounds) - 1, int(round(float(stim_t)))))
-        sites.append(DetectorSite(detector_id=detector_id, round_id=t, x=x, y=y))
-    return sites
+def _prediction_bit(prediction: np.ndarray) -> int:
+    arr = np.asarray(prediction, dtype=np.uint8).reshape(-1)
+    if arr.size == 0:
+        return 0
+    return int(np.sum(arr) % 2)
+
+
+def _target_qubits_from_pauli_product(pauli_product) -> set[int]:
+    qubits: set[int] = set()
+    for term in pauli_product:
+        gate_target = getattr(term, "gate_target", term)
+        predicates = []
+        for attr in ("is_qubit_target", "is_x_target", "is_y_target", "is_z_target"):
+            value = getattr(gate_target, attr, False)
+            predicates.append(value() if callable(value) else bool(value))
+        if any(predicates):
+            qubit_value = getattr(gate_target, "qubit_value")
+            if callable(qubit_value):
+                qubit_value = qubit_value()
+            qubits.add(int(qubit_value))
+    return qubits
+
+
+def build_location_oracle(circuit, dem) -> OracleMap:
+    """Map ``(tick, stim_qubit)`` locations to exact DEM target signatures."""
+    oracle: OracleMap = {}
+    explained_errors = circuit.explain_detector_error_model_errors(
+        dem_filter=dem,
+        reduce_to_one_representative_error=False,
+    )
+    for explained_error in explained_errors:
+        signature = tuple(term.dem_target for term in explained_error.dem_error_terms)
+        if not signature:
+            continue
+        for loc in explained_error.circuit_error_locations:
+            tick = int(getattr(loc, "tick_offset", 0))
+            qubits = _target_qubits_from_pauli_product(loc.flipped_pauli_product)
+            for qubit in qubits:
+                oracle.setdefault((tick, int(qubit)), []).append(signature)
+
+    for key, signatures in list(oracle.items()):
+        seen = set()
+        unique: list[Signature] = []
+        for signature in signatures:
+            sig_key = tuple(str(target) for target in signature)
+            if sig_key in seen:
+                continue
+            seen.add(sig_key)
+            unique.append(signature)
+        oracle[key] = unique
+    return oracle
+
+
+def _basis_sidecar_batch(
+    sidecar: BasisSidecar,
+    *,
+    data_mask: np.ndarray,
+    measure_mask: np.ndarray,
+) -> ErasureSidecarBatch:
+    return ErasureSidecarBatch(
+        basis=sidecar.basis,
+        data_erasures=np.asarray(data_mask, dtype=np.uint8),
+        measure_erasures=np.asarray(measure_mask, dtype=np.uint8),
+        readout_ambiguity=sidecar.readout_ambiguity.astype(np.float32, copy=False),
+        site_records=[],
+        physical_data_erasures=sidecar.physical_data_erasures.astype(np.uint8, copy=False),
+        physical_measure_erasures=sidecar.physical_measure_erasures.astype(np.uint8, copy=False),
+    )
+
+
+def build_basis_tensors(
+    *,
+    distance: int,
+    rounds: int,
+    basis: str,
+    detector_samples: np.ndarray,
+    detector_coordinates: dict[int, tuple[float, ...]],
+    sidecar: BasisSidecar,
+    max_shots: int | None,
+) -> np.ndarray:
+    """Reconstruct basis-specific dense tensors for CNN inference."""
+    num_shots = detector_samples.shape[0] if max_shots is None else min(detector_samples.shape[0], int(max_shots))
+    observed_data, observed_measure = sidecar.observed_mask()
+    batch_sidecar = _basis_sidecar_batch(
+        sidecar,
+        data_mask=observed_data[:num_shots],
+        measure_mask=observed_measure[:num_shots],
+    )
+    tensors = []
+    for shot_index in range(num_shots):
+        events = generate_stim_assisted_events(
+            distance=distance,
+            rounds=rounds,
+            shot_index=shot_index,
+            detector_samples=detector_samples,
+            basis=basis,
+            detector_coordinates=detector_coordinates,
+            erasure_sidecar=batch_sidecar,
+        )
+        tensors.append(tensorize_events(events, distance=distance, rounds=rounds))
+    if not tensors:
+        return np.zeros((0, 7, int(rounds), int(distance), int(distance)), dtype=np.float32)
+    return np.stack(tensors).astype(np.float32)
 
 
 def _load_model(checkpoint: Path, device: torch.device) -> DualRailCNN3DPreDecoder:
@@ -115,147 +292,201 @@ def _load_model(checkpoint: Path, device: torch.device) -> DualRailCNN3DPreDecod
     return model
 
 
-def _cnn_erasure_masks(
-    dataset: DualRailShardDataset,
+def cnn_erasure_masks_for_basis(
     *,
     model: DualRailCNN3DPreDecoder,
     device: torch.device,
+    basis_inputs: np.ndarray,
     batch_size: int,
     erasure_channel: int,
     threshold: float,
-    max_shots: int | None,
-) -> np.ndarray:
+) -> tuple[np.ndarray, float]:
     masks: list[np.ndarray] = []
-    seen = 0
     with torch.no_grad():
-        for shard in dataset.iter_shards():
-            inputs = shard["inputs"]
-            if max_shots is not None:
-                remaining = int(max_shots) - seen
-                if remaining <= 0:
-                    break
-                inputs = inputs[:remaining]
-            for start in range(0, inputs.shape[0], int(batch_size)):
-                batch = torch.as_tensor(inputs[start:start + int(batch_size)], dtype=torch.float32, device=device)
-                logits = model(batch)
-                if not 0 <= int(erasure_channel) < logits.shape[1]:
-                    raise ValueError(f"erasure_channel={erasure_channel} is invalid for logits shape {tuple(logits.shape)}")
-                mask = (torch.sigmoid(logits[:, int(erasure_channel)]) >= float(threshold)).to(torch.uint8)
-                masks.append(mask.cpu().numpy())
-            seen += int(inputs.shape[0])
+        for start in range(0, basis_inputs.shape[0], int(batch_size)):
+            batch = torch.as_tensor(basis_inputs[start:start + int(batch_size)], dtype=torch.float32, device=device)
+            logits = model(batch)
+            if not 0 <= int(erasure_channel) < logits.shape[1]:
+                raise ValueError(f"erasure_channel={erasure_channel} invalid for logits shape {tuple(logits.shape)}")
+            mask = (torch.sigmoid(logits[:, int(erasure_channel)]) >= float(threshold)).to(torch.uint8)
+            masks.append(mask.cpu().numpy())
     if not masks:
-        return np.zeros((0, *dataset.metadata["input_shape"][1:]), dtype=np.uint8)
-    return np.concatenate(masks, axis=0)
+        shape = tuple(int(v) for v in basis_inputs.shape[2:])
+        return np.zeros((0, *shape), dtype=np.uint8), 0.0
+    out = np.concatenate(masks, axis=0)
+    return out, float(np.mean(out)) if out.size else 0.0
 
 
-def _input_erasure_masks(
-    dataset: DualRailShardDataset,
+def _mask_to_locations(
     *,
-    max_shots: int | None,
-) -> np.ndarray:
-    masks: list[np.ndarray] = []
-    seen = 0
-    for shard in dataset.iter_shards():
-        inputs = shard["inputs"]
-        if max_shots is not None:
-            remaining = int(max_shots) - seen
-            if remaining <= 0:
-                break
-            inputs = inputs[:remaining]
-        masks.append(((inputs[:, 2] > 0.0) | (inputs[:, 3] > 0.0)).astype(np.uint8))
-        seen += int(inputs.shape[0])
-    if not masks:
-        return np.zeros((0, *dataset.metadata["input_shape"][1:]), dtype=np.uint8)
-    return np.concatenate(masks, axis=0)
-
-
-def _edge_touches_erasure(
-    node1: int,
-    node2: int | None,
-    *,
-    detector_sites: list[DetectorSite],
-    erasure_mask: np.ndarray,
-    space_radius: int,
-    time_radius: int,
-) -> bool:
-    for node in (node1, node2):
-        if node is None:
-            continue
-        site = detector_sites[int(node)]
-        t0 = max(0, site.round_id - int(time_radius))
-        t1 = min(erasure_mask.shape[0], site.round_id + int(time_radius) + 1)
-        x0 = max(0, site.x - int(space_radius))
-        x1 = min(erasure_mask.shape[1], site.x + int(space_radius) + 1)
-        y0 = max(0, site.y - int(space_radius))
-        y1 = min(erasure_mask.shape[2], site.y + int(space_radius) + 1)
-        if bool(np.any(erasure_mask[t0:t1, x0:x1, y0:y1])):
-            return True
-    return False
-
-
-def _dynamic_matching_for_shot(
-    baseline: pymatching.Matching,
-    *,
-    detector_sites: list[DetectorSite],
-    erasure_mask: np.ndarray,
-    space_radius: int,
-    time_radius: int,
-    erasure_weight_scale: float,
-    min_erasure_weight: float,
-) -> tuple[pymatching.Matching, int]:
-    dynamic = pymatching.Matching()
-    touched_edges = 0
-    for node1, node2, data in baseline.edges():
-        weight = float(data.get("weight", 1.0))
-        if _edge_touches_erasure(
-            int(node1),
-            None if node2 is None else int(node2),
-            detector_sites=detector_sites,
-            erasure_mask=erasure_mask,
-            space_radius=space_radius,
-            time_radius=time_radius,
-        ):
-            weight = max(float(min_erasure_weight), weight * float(erasure_weight_scale))
-            touched_edges += 1
-        fault_ids = set(data.get("fault_ids", set()))
-        error_probability = data.get("error_probability")
-        if node2 is None:
-            dynamic.add_boundary_edge(
-                int(node1),
-                fault_ids=fault_ids,
-                weight=weight,
-                error_probability=error_probability,
-            )
-        else:
-            dynamic.add_edge(
-                int(node1),
-                int(node2),
-                fault_ids=fault_ids,
-                weight=weight,
-                error_probability=error_probability,
-            )
-    return dynamic, touched_edges
-
-
-def _prediction_bit(prediction: np.ndarray) -> int:
-    arr = np.asarray(prediction, dtype=np.uint8).reshape(-1)
-    if arr.size == 0:
-        return 0
-    return int(np.sum(arr) % 2)
-
-
-def _evaluate_basis(
-    *,
+    circuit,
     basis: str,
-    metadata: dict[str, Any],
-    dataset_dir: Path,
-    erasure_masks: np.ndarray,
-    max_shots: int | None,
-    space_radius: int,
-    time_radius: int,
-    erasure_weight_scale: float,
-    min_erasure_weight: float,
+    distance: int,
+    rounds: int,
+    data_mask: np.ndarray,
+    measure_mask: np.ndarray,
+) -> tuple[list[tuple[int, int]], int]:
+    geometry = SurfacePatchGeometry(distance=int(distance))
+    sites = extract_stim_qubit_layout(circuit, distance=distance)
+    total_ticks = _tick_count(circuit)
+    locations: list[tuple[int, int]] = []
+    missing = 0
+    for t in range(int(rounds)):
+        tick = _round_to_tick(t, rounds=rounds, total_ticks=total_ticks)
+        for x in range(int(distance)):
+            for y in range(int(distance)):
+                if bool(data_mask[t, x, y]):
+                    site = _nearest_site(sites, grid_x=x, grid_y=y, preferred_role=QubitRole.DATA)
+                    if site is None:
+                        missing += 1
+                    else:
+                        locations.append((tick, int(site.qubit)))
+                if bool(measure_mask[t, x, y]):
+                    role = geometry.role_at(x, y)
+                    preferred = role if role != QubitRole.DATA else _detector_role_for_grid(geometry, x, y, basis)
+                    site = _nearest_site(sites, grid_x=x, grid_y=y, preferred_role=preferred)
+                    if site is None:
+                        missing += 1
+                    else:
+                        locations.append((tick, int(site.qubit)))
+    return locations, missing
+
+
+def _signatures_for_mask(
+    *,
+    oracle: OracleMap,
+    circuit,
+    basis: str,
+    distance: int,
+    rounds: int,
+    data_mask: np.ndarray,
+    measure_mask: np.ndarray,
+) -> tuple[list[Signature], InjectionDiagnostics]:
+    locations, missing = _mask_to_locations(
+        circuit=circuit,
+        basis=basis,
+        distance=distance,
+        rounds=rounds,
+        data_mask=data_mask,
+        measure_mask=measure_mask,
+    )
+    diagnostics = InjectionDiagnostics(mask_locations=len(locations), missing_erased_locations=missing)
+    signatures: list[Signature] = []
+    seen_signatures = set()
+    for key in locations:
+        matches = oracle.get(key, [])
+        if matches:
+            diagnostics.oracle_lookup_hits += 1
+        else:
+            diagnostics.oracle_lookup_misses += 1
+        for signature in matches:
+            sig_key = tuple(str(target) for target in signature)
+            if sig_key in seen_signatures:
+                continue
+            seen_signatures.add(sig_key)
+            signatures.append(signature)
+    diagnostics.injected_signatures = len(signatures)
+    return signatures, diagnostics
+
+
+def _dem_with_injections(base_dem, signatures: list[Signature], probability: float):
+    dem = stim.DetectorErrorModel(str(base_dem))
+    for signature in signatures:
+        if signature:
+            dem.append("error", float(probability), list(signature))
+    return dem
+
+
+def _decode_with_injected_dem(
+    *,
+    base_dem,
+    detector_row: np.ndarray,
+    signatures: list[Signature],
+    oracle_probability: float,
+) -> np.ndarray:
+    injected_dem = _dem_with_injections(base_dem, signatures, oracle_probability)
+    matching = pymatching.Matching.from_detector_error_model(injected_dem)
+    return matching.decode(detector_row)
+
+
+def _evaluate_injection_regime(
+    *,
+    name: str,
+    base_dem,
+    detector_samples: np.ndarray,
+    truth_bits: np.ndarray,
+    oracle: OracleMap,
+    circuit,
+    basis: str,
+    distance: int,
+    rounds: int,
+    data_masks: np.ndarray,
+    measure_masks: np.ndarray,
+    oracle_probability: float,
 ) -> dict[str, float]:
+    errors = 0
+    diagnostics = InjectionDiagnostics()
+    for shot_index in range(detector_samples.shape[0]):
+        signatures, shot_diag = _signatures_for_mask(
+            oracle=oracle,
+            circuit=circuit,
+            basis=basis,
+            distance=distance,
+            rounds=rounds,
+            data_mask=data_masks[shot_index],
+            measure_mask=measure_masks[shot_index],
+        )
+        diagnostics.add(shot_diag)
+        prediction = _decode_with_injected_dem(
+            base_dem=base_dem,
+            detector_row=detector_samples[shot_index],
+            signatures=signatures,
+            oracle_probability=oracle_probability,
+        )
+        errors += int(_prediction_bit(prediction) != int(truth_bits[shot_index]))
+
+    shots = max(int(detector_samples.shape[0]), 1)
+    metrics = {
+        "shots": float(detector_samples.shape[0]),
+        "logical_errors": float(errors),
+        "ler": float(errors / shots),
+        "mask_density": float(np.mean(np.logical_or(data_masks, measure_masks))) if data_masks.size else 0.0,
+        "oracle_probability": float(oracle_probability),
+    }
+    metrics.update(diagnostics.to_metrics(shots))
+    metrics["regime"] = name
+    return metrics
+
+
+def _baseline_metrics(matching: pymatching.Matching, detector_samples: np.ndarray, truth_bits: np.ndarray) -> dict[str, float]:
+    predictions = matching.decode_batch(detector_samples)
+    pred_bits = np.asarray([_prediction_bit(row) for row in predictions], dtype=np.uint8)
+    errors = int(np.sum(pred_bits != truth_bits))
+    shots = max(int(detector_samples.shape[0]), 1)
+    return {
+        "shots": float(detector_samples.shape[0]),
+        "logical_errors": float(errors),
+        "ler": float(errors / shots),
+        "regime": "vanilla_pymatching",
+    }
+
+
+def evaluate_basis(
+    *,
+    dataset_dir: Path,
+    metadata: dict[str, Any],
+    basis: str,
+    sidecar: BasisSidecar,
+    checkpoint: Path,
+    model: DualRailCNN3DPreDecoder | None,
+    device: torch.device,
+    batch_size: int,
+    erasure_channel: int,
+    erasure_threshold: float,
+    max_shots: int | None,
+    oracle_probability: float,
+) -> dict[str, Any]:
+    basis_norm = str(basis).strip().upper()
     distance = int(metadata["distance"])
     rounds = int(metadata["rounds"])
     p_pauli = _noise_value(metadata, "p_pauli")
@@ -263,157 +494,226 @@ def _evaluate_basis(
     circuit = build_base_surface_code_circuit(
         distance=distance,
         rounds=rounds,
-        basis=basis,
+        basis=basis_norm,
         p_pauli=p_pauli,
         p_measure=p_measure,
     )
-    dem = circuit.detector_error_model(decompose_errors=True)
-    baseline = pymatching.Matching.from_detector_error_model(dem)
-    dets, observables = _parse_sparse_dets(
-        dataset_dir / f"samples_{basis}.dets",
+    base_dem = circuit.detector_error_model(decompose_errors=True)
+    vanilla_matching = pymatching.Matching.from_detector_error_model(base_dem)
+    detector_samples, observables = _parse_sparse_dets(
+        dataset_dir / f"samples_{basis_norm}.dets",
         num_detectors=int(circuit.num_detectors),
         num_observables=int(circuit.num_observables),
     )
     if max_shots is not None:
-        dets = dets[:int(max_shots)]
+        detector_samples = detector_samples[:int(max_shots)]
         observables = observables[:int(max_shots)]
-    if erasure_masks.shape[0] != dets.shape[0]:
-        raise ValueError(
-            f"CNN mask count {erasure_masks.shape[0]} does not match {basis} detector shots {dets.shape[0]}"
-        )
-
-    baseline_predictions = baseline.decode_batch(dets)
-    baseline_bits = np.asarray([_prediction_bit(row) for row in baseline_predictions], dtype=np.uint8)
     truth_bits = np.asarray([_prediction_bit(row) for row in observables], dtype=np.uint8)
-    baseline_errors = int(np.sum(baseline_bits != truth_bits))
+    num_shots = detector_samples.shape[0]
 
-    detector_sites = _detector_sites(circuit, distance=distance, rounds=rounds)
-    assisted_errors = 0
-    touched_edge_total = 0
-    for shot_index in range(dets.shape[0]):
-        dynamic, touched_edges = _dynamic_matching_for_shot(
-            baseline,
-            detector_sites=detector_sites,
-            erasure_mask=erasure_masks[shot_index],
-            space_radius=space_radius,
-            time_radius=time_radius,
-            erasure_weight_scale=erasure_weight_scale,
-            min_erasure_weight=min_erasure_weight,
-        )
-        prediction = dynamic.decode(dets[shot_index])
-        assisted_errors += int(_prediction_bit(prediction) != int(truth_bits[shot_index]))
-        touched_edge_total += int(touched_edges)
+    oracle = build_location_oracle(circuit, base_dem)
+    physical_data, physical_measure = sidecar.physical_mask()
+    observed_data, observed_measure = sidecar.observed_mask()
+    physical_data = physical_data[:num_shots]
+    physical_measure = physical_measure[:num_shots]
+    observed_data = observed_data[:num_shots]
+    observed_measure = observed_measure[:num_shots]
 
-    shots = max(int(dets.shape[0]), 1)
-    return {
-        "shots": float(dets.shape[0]),
-        "baseline_logical_errors": float(baseline_errors),
-        "baseline_ler": float(baseline_errors / shots),
-        "cnn_assisted_logical_errors": float(assisted_errors),
-        "cnn_assisted_ler": float(assisted_errors / shots),
-        "mean_dynamic_edges_per_shot": float(touched_edge_total / shots),
-        "num_detectors": float(circuit.num_detectors),
-        "num_observables": float(circuit.num_observables),
+    detector_coordinates = {
+        int(k): tuple(float(v_i) for v_i in v)
+        for k, v in circuit.get_detector_coordinates().items()
     }
+    cnn_data = np.zeros_like(observed_data)
+    cnn_measure = np.zeros_like(observed_measure)
+    cnn_density = 0.0
+    if model is not None:
+        basis_inputs = build_basis_tensors(
+            distance=distance,
+            rounds=rounds,
+            basis=basis_norm,
+            detector_samples=detector_samples,
+            detector_coordinates=detector_coordinates,
+            sidecar=sidecar,
+            max_shots=num_shots,
+        )
+        cnn_mask, cnn_density = cnn_erasure_masks_for_basis(
+            model=model,
+            device=device,
+            basis_inputs=basis_inputs,
+            batch_size=batch_size,
+            erasure_channel=erasure_channel,
+            threshold=erasure_threshold,
+        )
+        roles = np.zeros((distance, distance), dtype=np.uint8)
+        geometry = SurfacePatchGeometry(distance=distance)
+        for x in range(distance):
+            for y in range(distance):
+                roles[x, y] = 1 if geometry.role_at(x, y) == QubitRole.DATA else 2
+        cnn_data = (cnn_mask & (roles[None, None, :, :] == 1)).astype(np.uint8)
+        cnn_measure = (cnn_mask & (roles[None, None, :, :] != 1)).astype(np.uint8)
+
+    regimes = {
+        "vanilla_pymatching": _baseline_metrics(vanilla_matching, detector_samples, truth_bits),
+        "physical_location_oracle": _evaluate_injection_regime(
+            name="physical_location_oracle",
+            base_dem=base_dem,
+            detector_samples=detector_samples,
+            truth_bits=truth_bits,
+            oracle=oracle,
+            circuit=circuit,
+            basis=basis_norm,
+            distance=distance,
+            rounds=rounds,
+            data_masks=physical_data,
+            measure_masks=physical_measure,
+            oracle_probability=oracle_probability,
+        ),
+        "observed_sidecar_dem_injection": _evaluate_injection_regime(
+            name="observed_sidecar_dem_injection",
+            base_dem=base_dem,
+            detector_samples=detector_samples,
+            truth_bits=truth_bits,
+            oracle=oracle,
+            circuit=circuit,
+            basis=basis_norm,
+            distance=distance,
+            rounds=rounds,
+            data_masks=observed_data,
+            measure_masks=observed_measure,
+            oracle_probability=oracle_probability,
+        ),
+        "cnn_dem_injection": _evaluate_injection_regime(
+            name="cnn_dem_injection",
+            base_dem=base_dem,
+            detector_samples=detector_samples,
+            truth_bits=truth_bits,
+            oracle=oracle,
+            circuit=circuit,
+            basis=basis_norm,
+            distance=distance,
+            rounds=rounds,
+            data_masks=cnn_data,
+            measure_masks=cnn_measure,
+            oracle_probability=oracle_probability,
+        ),
+    }
+    vanilla_ler = regimes["vanilla_pymatching"]["ler"]
+    for metrics in regimes.values():
+        metrics["delta_vs_vanilla"] = float(metrics["ler"] - vanilla_ler)
+
+    return {
+        "basis": basis_norm,
+        "num_detectors": int(circuit.num_detectors),
+        "num_observables": int(circuit.num_observables),
+        "oracle_locations": int(len(oracle)),
+        "oracle_signatures": int(sum(len(v) for v in oracle.values())),
+        "cnn_basis_mask_density": float(cnn_density),
+        "regimes": regimes,
+    }
+
+
+def _aggregate_results(basis_results: dict[str, Any]) -> dict[str, Any]:
+    regimes: dict[str, dict[str, float]] = {}
+    for result in basis_results.values():
+        for name, metrics in result["regimes"].items():
+            agg = regimes.setdefault(
+                name,
+                {
+                    "shots": 0.0,
+                    "logical_errors": 0.0,
+                    "mask_locations": 0.0,
+                    "missing_erased_locations": 0.0,
+                    "oracle_lookup_hits": 0.0,
+                    "oracle_lookup_misses": 0.0,
+                    "injected_signatures": 0.0,
+                },
+            )
+            agg["shots"] += float(metrics.get("shots", 0.0))
+            agg["logical_errors"] += float(metrics.get("logical_errors", 0.0))
+            for key in (
+                "mask_locations",
+                "missing_erased_locations",
+                "oracle_lookup_hits",
+                "oracle_lookup_misses",
+                "injected_signatures",
+            ):
+                agg[key] += float(metrics.get(key, 0.0))
+
+    vanilla_ler = None
+    for name, agg in regimes.items():
+        shots = max(float(agg["shots"]), 1.0)
+        agg["ler"] = float(agg["logical_errors"] / shots)
+        agg["mean_mask_locations_per_shot"] = float(agg["mask_locations"] / shots)
+        agg["mean_injected_signatures_per_shot"] = float(agg["injected_signatures"] / shots)
+        if name == "vanilla_pymatching":
+            vanilla_ler = agg["ler"]
+    vanilla_ler = 0.0 if vanilla_ler is None else float(vanilla_ler)
+    for agg in regimes.values():
+        agg["delta_vs_vanilla"] = float(agg["ler"] - vanilla_ler)
+    return regimes
 
 
 def evaluate_pipeline(
     *,
     dataset_dir: Path,
-    checkpoint: Path,
+    checkpoint: Path | None,
     batch_size: int = 64,
-    mask_source: str = "cnn",
     erasure_channel: int = 3,
     erasure_threshold: float = 0.5,
     bases: tuple[str, ...] = ("X", "Z"),
     max_shots: int | None = None,
-    space_radius: int = 1,
-    time_radius: int = 1,
-    erasure_weight_scale: float = 0.05,
-    min_erasure_weight: float = 0.001,
+    oracle_probability: float = 0.499999,
     device: str | None = None,
 ) -> dict[str, Any]:
     dataset = DualRailShardDataset(dataset_dir)
     metadata = dataset.metadata
     dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    mask_source_norm = str(mask_source).strip().lower()
-    if mask_source_norm == "cnn":
-        model = _load_model(checkpoint, dev)
-        erasure_masks = _cnn_erasure_masks(
-            dataset,
+    model = _load_model(checkpoint, dev) if checkpoint is not None else None
+
+    basis_results = {}
+    for basis in bases:
+        basis_norm = str(basis).strip().upper()
+        sidecar = load_basis_sidecar(dataset_dir, basis_norm)
+        basis_results[basis_norm] = evaluate_basis(
+            dataset_dir=dataset_dir,
+            metadata=metadata,
+            basis=basis_norm,
+            sidecar=sidecar,
+            checkpoint=checkpoint or Path(""),
             model=model,
             device=dev,
             batch_size=batch_size,
             erasure_channel=erasure_channel,
-            threshold=erasure_threshold,
+            erasure_threshold=erasure_threshold,
             max_shots=max_shots,
+            oracle_probability=oracle_probability,
         )
-    elif mask_source_norm == "input":
-        erasure_masks = _input_erasure_masks(dataset, max_shots=max_shots)
-    else:
-        raise ValueError(f"mask_source must be 'cnn' or 'input', got {mask_source!r}")
-    results = {
+
+    return {
         "dataset_dir": str(dataset_dir),
-        "checkpoint": str(checkpoint),
+        "checkpoint": None if checkpoint is None else str(checkpoint),
         "device": str(dev),
-        "shots": int(erasure_masks.shape[0]),
-        "mask_source": mask_source_norm,
-        "mask_erasure_density": float(np.mean(erasure_masks)) if erasure_masks.size else 0.0,
+        "distance": int(metadata["distance"]),
+        "rounds": int(metadata["rounds"]),
+        "max_shots": None if max_shots is None else int(max_shots),
+        "oracle_probability": float(oracle_probability),
         "erasure_channel": int(erasure_channel),
         "erasure_threshold": float(erasure_threshold),
-        "space_radius": int(space_radius),
-        "time_radius": int(time_radius),
-        "erasure_weight_scale": float(erasure_weight_scale),
-        "min_erasure_weight": float(min_erasure_weight),
-        "basis": {},
+        "basis": basis_results,
+        "aggregate": _aggregate_results(basis_results),
     }
-    total_shots = 0
-    baseline_errors = 0
-    assisted_errors = 0
-    for basis in bases:
-        basis_norm = str(basis).strip().upper()
-        basis_metrics = _evaluate_basis(
-            basis=basis_norm,
-            metadata=metadata,
-            dataset_dir=dataset_dir,
-            erasure_masks=erasure_masks,
-            max_shots=max_shots,
-            space_radius=space_radius,
-            time_radius=time_radius,
-            erasure_weight_scale=erasure_weight_scale,
-            min_erasure_weight=min_erasure_weight,
-        )
-        results["basis"][basis_norm] = basis_metrics
-        total_shots += int(basis_metrics["shots"])
-        baseline_errors += int(basis_metrics["baseline_logical_errors"])
-        assisted_errors += int(basis_metrics["cnn_assisted_logical_errors"])
-
-    total_shots = max(total_shots, 1)
-    results["aggregate"] = {
-        "shots": float(total_shots),
-        "baseline_logical_errors": float(baseline_errors),
-        "baseline_ler": float(baseline_errors / total_shots),
-        "cnn_assisted_logical_errors": float(assisted_errors),
-        "cnn_assisted_ler": float(assisted_errors / total_shots),
-        "ler_delta": float((assisted_errors - baseline_errors) / total_shots),
-    }
-    return results
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate CNN-guided dynamic erasure weighting for PyMatching.")
+    parser = argparse.ArgumentParser(description="Evaluate erasure-aware dual-rail decoder regimes.")
     parser.add_argument("--dataset-dir", type=Path, required=True)
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--mask-source", choices=("cnn", "input"), default="cnn")
     parser.add_argument("--erasure-channel", type=int, default=3)
     parser.add_argument("--erasure-threshold", type=float, default=0.5)
     parser.add_argument("--basis", action="append", choices=("X", "Z"), default=None)
     parser.add_argument("--max-shots", type=int, default=None)
-    parser.add_argument("--space-radius", type=int, default=1)
-    parser.add_argument("--time-radius", type=int, default=1)
-    parser.add_argument("--erasure-weight-scale", type=float, default=0.05)
-    parser.add_argument("--min-erasure-weight", type=float, default=0.001)
+    parser.add_argument("--oracle-probability", type=float, default=0.499999)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--output-json", type=Path, default=None)
     return parser.parse_args()
@@ -425,15 +725,11 @@ def main() -> None:
         dataset_dir=args.dataset_dir,
         checkpoint=args.checkpoint,
         batch_size=args.batch_size,
-        mask_source=args.mask_source,
         erasure_channel=args.erasure_channel,
         erasure_threshold=args.erasure_threshold,
         bases=tuple(args.basis or ("X", "Z")),
         max_shots=args.max_shots,
-        space_radius=args.space_radius,
-        time_radius=args.time_radius,
-        erasure_weight_scale=args.erasure_weight_scale,
-        min_erasure_weight=args.min_erasure_weight,
+        oracle_probability=args.oracle_probability,
         device=args.device,
     )
     text = json.dumps(results, indent=2, sort_keys=True)
